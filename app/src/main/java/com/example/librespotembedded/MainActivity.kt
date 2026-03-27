@@ -1,76 +1,59 @@
-// MainActivity.kt
 package com.example.librespotembedded
 
-import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.util.Log
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.SkipNext
+import androidx.compose.material.icons.automirrored.filled.SkipPrevious
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
+import coil.compose.AsyncImage
 import com.example.librespotembedded.ui.theme.LibrespotEmbeddedTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import mobilebind.Librespot
-import org.json.JSONObject
-import java.io.File
 
 class MainActivity : ComponentActivity() {
     private val TAG = "LibrespotDemo"
-    private val credentialsFileName = "creds.json"
 
     private var librespotService: LibrespotService? by mutableStateOf(null)
     private var isBound by mutableStateOf(false)
-    private var librespot by mutableStateOf<Librespot?>(null)
     
     private lateinit var webView: WebView
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as LibrespotService.LocalBinder
-            librespotService = binder.getService()
+            val s = binder.getService()
+            librespotService = s
             isBound = true
-            
-            // Now that we're bound, initialize librespot via the service
-            setupLibrespot(librespotService!!)
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             isBound = false
             librespotService = null
-        }
-    }
-
-    companion object {
-        init {
-            try {
-                Log.i("LibrespotNative", "Support libraries loaded successfully")
-                System.loadLibrary("gojni")
-                Log.i("LibrespotNative", "gojni loaded successfully")
-            } catch (e: UnsatisfiedLinkError) {
-                Log.e("LibrespotNative", "Failed to load libraries", e)
-            }
         }
     }
 
@@ -95,44 +78,13 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    var hasNotificationPermission by remember {
-                        mutableStateOf(
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                ContextCompat.checkSelfPermission(
-                                    this,
-                                    Manifest.permission.POST_NOTIFICATIONS
-                                ) == PackageManager.PERMISSION_GRANTED
-                            } else {
-                                true
-                            }
-                        )
-                    }
-
-                    val permissionLauncher = rememberLauncherForActivityResult(
-                        contract = ActivityResultContracts.RequestPermission()
-                    ) { isGranted ->
-                        hasNotificationPermission = isGranted
-                    }
-
-                    LaunchedEffect(Unit) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                        }
-                    }
-
-                    var currentTrack by remember { mutableStateOf("—") }
+                    val service = librespotService
                     var showAuth by remember { mutableStateOf(false) }
                     var isAuthenticating by remember { mutableStateOf(false) }
                     val scope = rememberCoroutineScope()
 
-                    val currentLibrespot = librespot
-                    if (currentLibrespot == null) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .safeDrawingPadding(), 
-                            contentAlignment = Alignment.Center
-                        ) {
+                    if (service == null) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             CircularProgressIndicator()
                         }
                     } else {
@@ -155,106 +107,40 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         } else {
-                            Box(modifier = Modifier.safeDrawingPadding()) {
-                                LibrespotUI(
-                                    librespotService = librespotService,
-                                    onAuthenticate = {
-                                        val authUrl = currentLibrespot.beginInteractiveAuth()
-                                        webView.webViewClient = object : WebViewClient() {
-                                            override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
-                                                if (url != null && url.startsWith("http://127.0.0.1")) {
-                                                    showAuth = false
-                                                    isAuthenticating = true
-                                                    scope.launch(Dispatchers.IO) {
-                                                        try {
-                                                            currentLibrespot.completeInteractiveAuth(url)
-                                                        } catch (e: Exception) {
-                                                            Log.e(TAG, "Error completing auth", e)
-                                                        } finally {
-                                                            withContext(Dispatchers.Main) {
-                                                                isAuthenticating = false
-                                                            }
+                            LibrespotPlayerUI(
+                                service = service,
+                                onAuthenticate = {
+                                    val authUrl = service.beginInteractiveAuth()
+                                    webView.webViewClient = object : WebViewClient() {
+                                        override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
+                                            if (url != null && url.startsWith("http://127.0.0.1")) {
+                                                showAuth = false
+                                                isAuthenticating = true
+                                                scope.launch(Dispatchers.IO) {
+                                                    try {
+                                                        service.completeInteractiveAuth(url)
+                                                    } catch (e: Exception) {
+                                                        Log.e(TAG, "Error completing auth", e)
+                                                    } finally {
+                                                        withContext(Dispatchers.Main) {
+                                                            isAuthenticating = false
                                                         }
                                                     }
-                                                    return true
                                                 }
-                                                return false
+                                                return true
                                             }
+                                            return false
                                         }
-                                        webView.loadUrl(authUrl)
-                                        showAuth = true
-                                    },
-                                    currentTrack = currentTrack
-                                )
-                            }
+                                    }
+                                    webView.loadUrl(authUrl)
+                                    showAuth = true
+                                }
+                            )
                         }
                     }
                 }
             }
         }
-    }
-
-    private fun setupLibrespot(service: LibrespotService) {
-        lifecycleScope.launch(Dispatchers.IO) {
-            val cfg = JSONObject().apply {
-                put("device_id", "a80e66172f552359922a3b472a2a30d8a4ef89ee")
-                put("device_name", "Android Compose Demo")
-                put("device_type", "smartphone")
-                put("audio_backend", "oto")
-                put("volume_steps", 16)
-                put("initial_volume", 8)
-                put("flac_enabled", false)
-                put("credentials", JSONObject().apply {
-                    put("type", "interactive")
-                    put("spotify_token", JSONObject().apply {
-                        put("username", "")
-                        put("data", "")
-                    })
-                })
-                put("server", JSONObject().apply { put("enabled", false) })
-                put("zeroconf_enabled", false)
-            }
-
-            restoreCredentials()?.let { (u, d) ->
-                cfg.getJSONObject("credentials")
-                    .getJSONObject("spotify_token")
-                    .apply {
-                        put("username", u)
-                        put("data", d)
-                    }
-            }
-
-            val instance = service.getLibrespotInstance()
-            instance.setCredentialCallback(object : mobilebind.CredentialCallback {
-                override fun onCredentialsPersist(credentialsJson: String) {
-                    val j = JSONObject(credentialsJson)
-                    val u = j.optString("username")
-                    val d = j.optString("data")
-                    val outFile = File(filesDir, "creds.json")
-                    outFile.writeText(JSONObject().apply {
-                        put("username", u)
-                        put("data", d)
-                    }.toString())
-                }
-            })
-
-            // Start librespot if not already started
-            instance.startWithConfigJSON(cfg.toString(), null)
-
-            withContext(Dispatchers.Main) {
-                librespot = instance
-            }
-        }
-    }
-
-    private fun restoreCredentials(): Pair<String, String>? {
-        val file = File(filesDir, credentialsFileName)
-        if (!file.exists()) return null
-        val txt = file.readText()
-        val j = JSONObject(txt)
-        val u = j.optString("username")
-        val d = j.optString("data")
-        return if (u.isNotEmpty() && d.isNotEmpty()) Pair(u, d) else null
     }
 
     override fun onDestroy() {
@@ -267,31 +153,161 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun LibrespotUI(
-    librespotService: LibrespotService?,
-    onAuthenticate: () -> Unit,
-    currentTrack: String
+fun LibrespotPlayerUI(
+    service: LibrespotService,
+    onAuthenticate: () -> Unit
 ) {
-    val scope = rememberCoroutineScope()
+    val metadata = service.metadata
+    val isPlaying = service.is_playing
 
-    Column(modifier = Modifier.padding(16.dp)) {
-        Text(text = "Now Playing: $currentTrack", style = MaterialTheme.typography.titleMedium)
-        Spacer(modifier = Modifier.height(16.dp))
-
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { scope.launch(Dispatchers.IO) { librespotService?.handlePlay() } }) { Text("Play") }
-            Button(onClick = { scope.launch(Dispatchers.IO) { librespotService?.handlePause() } }) { Text("Pause") }
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .safeDrawingPadding()
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically)
+    ) {
+        // Album Art
+        Card(
+            modifier = Modifier
+                .size(320.dp)
+                .aspectRatio(1f),
+            shape = MaterialTheme.shapes.large,
+            elevation = CardDefaults.cardElevation(defaultElevation = 12.dp)
+        ) {
+            if (metadata?.album_cover_url?.isNotEmpty() == true) {
+                AsyncImage(
+                    model = metadata.album_cover_url,
+                    contentDescription = "Album Art",
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop
+                )
+            } else {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.PlayArrow,
+                        contentDescription = null,
+                        modifier = Modifier.size(100.dp),
+                        tint = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { scope.launch(Dispatchers.IO) { librespotService?.handleNext() } }) { Text("Next") }
-            Button(onClick = { scope.launch(Dispatchers.IO) { librespotService?.handlePrevious() } }) { Text("Prev") }
+        // Track Info
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = metadata?.name ?: "No Track Playing",
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = metadata?.artist_names?.joinToString(", ") ?: "Connect to start",
+                style = MaterialTheme.typography.titleLarge,
+                color = MaterialTheme.colorScheme.secondary,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (metadata?.album_name?.isNotEmpty() == true) {
+                Text(
+                    text = metadata.album_name,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.outline,
+                    textAlign = TextAlign.Center,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        // Progress Slider (Placeholder interaction for now)
+        val position = metadata?.position?.toFloat() ?: 0f
+        val duration = metadata?.duration?.toFloat() ?: 1f
+        val progress = if (duration > 0) position / duration else 0f
+        
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
+            Slider(
+                value = progress,
+                onValueChange = { /* Handle seek? */ },
+                enabled = false, // Service doesn't support seek yet in this UI
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(formatTime(metadata?.position ?: 0), style = MaterialTheme.typography.labelMedium)
+                Text(formatTime(metadata?.duration ?: 0), style = MaterialTheme.typography.labelMedium)
+            }
+        }
 
-        Button(onClick = onAuthenticate) { Text("Authenticate") }
+        // Controls
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(32.dp)
+        ) {
+            IconButton(
+                onClick = { service.handlePrevious() },
+                modifier = Modifier.size(56.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.SkipPrevious,
+                    contentDescription = "Previous",
+                    modifier = Modifier.size(40.dp)
+                )
+            }
+
+            FilledIconButton(
+                onClick = { if (isPlaying) service.handlePause() else service.handlePlay() },
+                modifier = Modifier.size(80.dp),
+                colors = IconButtonDefaults.filledIconButtonColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            ) {
+                Icon(
+                    imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Default.PlayArrow,
+                    contentDescription = if (isPlaying) "Pause" else "Play",
+                    modifier = Modifier.size(48.dp)
+                )
+            }
+
+            IconButton(
+                onClick = { service.handleNext() },
+                modifier = Modifier.size(56.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.SkipNext,
+                    contentDescription = "Next",
+                    modifier = Modifier.size(40.dp)
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        OutlinedButton(
+            onClick = onAuthenticate,
+            modifier = Modifier.fillMaxWidth(0.7f)
+        ) {
+            Text("Switch Account")
+        }
     }
+}
+
+private fun formatTime(ms: Long): String {
+    val totalSeconds = ms / 1000
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return "%d:%02d".format(minutes, seconds)
 }
