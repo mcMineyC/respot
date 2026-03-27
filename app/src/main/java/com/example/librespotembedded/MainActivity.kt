@@ -12,20 +12,29 @@ import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.SkipNext
-import androidx.compose.material.icons.automirrored.filled.SkipPrevious
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.rounded.Pause
+import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.SkipNext
+import androidx.compose.material.icons.rounded.SkipPrevious
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -34,6 +43,7 @@ import com.example.librespotembedded.ui.theme.LibrespotEmbeddedTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.sin
 
 class MainActivity : ComponentActivity() {
     private val TAG = "LibrespotDemo"
@@ -61,7 +71,6 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
-        // Start and bind to the foreground service
         val intent = Intent(this, LibrespotService::class.java)
         startForegroundService(intent)
         bindService(intent, connection, Context.BIND_AUTO_CREATE)
@@ -159,149 +168,272 @@ fun LibrespotPlayerUI(
 ) {
     val metadata = service.metadata
     val isPlaying = service.is_playing
+    val position = service.positionMs
+    val duration = metadata?.duration ?: 1L
+    val progress = (position.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
+
+    // Expressive scale animation for the album art
+    val albumArtScale by animateFloatAsState(
+        targetValue = if (isPlaying) 1f else 0.92f,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
+        label = "albumArtScale"
+    )
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .safeDrawingPadding()
-            .padding(24.dp),
+            .padding(horizontal = 28.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically)
+        verticalArrangement = Arrangement.Center
     ) {
-        // Album Art
+        // Expressive Album Art - connected to playback toggle
         Card(
+            onClick = { if (isPlaying) service.handlePause() else service.handlePlay() },
             modifier = Modifier
-                .size(320.dp)
-                .aspectRatio(1f),
-            shape = MaterialTheme.shapes.large,
-            elevation = CardDefaults.cardElevation(defaultElevation = 12.dp)
+                .fillMaxWidth()
+                .aspectRatio(1f)
+                .scale(albumArtScale),
+            shape = RoundedCornerShape(48.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = if (isPlaying) 12.dp else 2.dp)
         ) {
-            if (metadata?.album_cover_url?.isNotEmpty() == true) {
-                AsyncImage(
-                    model = metadata.album_cover_url,
-                    contentDescription = "Album Art",
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Crop
-                )
-            } else {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.PlayArrow,
-                        contentDescription = null,
-                        modifier = Modifier.size(100.dp),
-                        tint = MaterialTheme.colorScheme.surfaceVariant
+            Box(modifier = Modifier.fillMaxSize()) {
+                if (metadata?.album_cover_url?.isNotEmpty() == true) {
+                    AsyncImage(
+                        model = metadata.album_cover_url,
+                        contentDescription = "Album Art",
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
                     )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(MaterialTheme.colorScheme.surfaceVariant),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.PlayArrow,
+                            contentDescription = null,
+                            modifier = Modifier.size(120.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.2f)
+                        )
+                    }
+                }
+                
+                // Show play icon overlay when paused to signify clickability
+                if (!isPlaying && metadata != null) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black.copy(alpha = 0.15f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Surface(
+                            modifier = Modifier.size(80.dp),
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f),
+                            tonalElevation = 8.dp
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Rounded.PlayArrow,
+                                    contentDescription = "Play",
+                                    modifier = Modifier.size(48.dp),
+                                    tint = MaterialTheme.colorScheme.onPrimaryContainer
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(48.dp))
 
         // Track Info
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.Start
+        ) {
             Text(
                 text = metadata?.name ?: "No Track Playing",
-                style = MaterialTheme.typography.headlineMedium,
+                style = MaterialTheme.typography.displaySmall,
                 fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurface
             )
             Text(
                 text = metadata?.artist_names?.joinToString(", ") ?: "Connect to start",
                 style = MaterialTheme.typography.titleLarge,
-                color = MaterialTheme.colorScheme.secondary,
-                textAlign = TextAlign.Center,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
-            if (metadata?.album_name?.isNotEmpty() == true) {
-                Text(
-                    text = metadata.album_name,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.outline,
-                    textAlign = TextAlign.Center,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
         }
 
-        // Progress Slider (Placeholder interaction for now)
-        val position = metadata?.position?.toFloat() ?: 0f
-        val duration = metadata?.duration?.toFloat() ?: 1f
-        val progress = if (duration > 0) position / duration else 0f
-        
-        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
-            Slider(
-                value = progress,
-                onValueChange = { /* Handle seek? */ },
-                enabled = false, // Service doesn't support seek yet in this UI
-                modifier = Modifier.fillMaxWidth()
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(formatTime(metadata?.position ?: 0), style = MaterialTheme.typography.labelMedium)
-                Text(formatTime(metadata?.duration ?: 0), style = MaterialTheme.typography.labelMedium)
-            }
-        }
+        Spacer(modifier = Modifier.height(32.dp))
 
-        // Controls
+        // Wiggly Progress Bar
+        WigglyProgressBar(
+            progress = progress,
+            isPlaying = isPlaying,
+            modifier = Modifier.fillMaxWidth().height(48.dp)
+        )
+
         Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = formatTime(position),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = formatTime(duration),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        Spacer(modifier = Modifier.height(40.dp))
+
+        // Expressive Controls
+        Row(
+            modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(32.dp)
+            horizontalArrangement = Arrangement.SpaceAround
         ) {
             IconButton(
                 onClick = { service.handlePrevious() },
-                modifier = Modifier.size(56.dp)
+                modifier = Modifier.size(64.dp)
             ) {
                 Icon(
-                    imageVector = Icons.AutoMirrored.Filled.SkipPrevious,
+                    imageVector = Icons.Rounded.SkipPrevious,
                     contentDescription = "Previous",
-                    modifier = Modifier.size(40.dp)
+                    modifier = Modifier.size(40.dp),
+                    tint = MaterialTheme.colorScheme.onSurface
                 )
             }
 
-            FilledIconButton(
+            Surface(
                 onClick = { if (isPlaying) service.handlePause() else service.handlePlay() },
-                modifier = Modifier.size(80.dp),
-                colors = IconButtonDefaults.filledIconButtonColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer
-                )
+                modifier = Modifier.size(96.dp),
+                shape = RoundedCornerShape(28.dp),
+                color = MaterialTheme.colorScheme.primaryContainer,
+                tonalElevation = 4.dp
             ) {
-                Icon(
-                    imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Default.PlayArrow,
-                    contentDescription = if (isPlaying) "Pause" else "Play",
-                    modifier = Modifier.size(48.dp)
-                )
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                        contentDescription = if (isPlaying) "Pause" else "Play",
+                        modifier = Modifier.size(48.dp),
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                }
             }
 
             IconButton(
                 onClick = { service.handleNext() },
-                modifier = Modifier.size(56.dp)
+                modifier = Modifier.size(64.dp)
             ) {
                 Icon(
-                    imageVector = Icons.AutoMirrored.Filled.SkipNext,
+                    imageVector = Icons.Rounded.SkipNext,
                     contentDescription = "Next",
-                    modifier = Modifier.size(40.dp)
+                    modifier = Modifier.size(40.dp),
+                    tint = MaterialTheme.colorScheme.onSurface
                 )
             }
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.weight(1f))
 
-        OutlinedButton(
-            onClick = onAuthenticate,
-            modifier = Modifier.fillMaxWidth(0.7f)
-        ) {
-            Text("Switch Account")
+        if (!service.isLoggedIn) {
+            Button(
+                onClick = onAuthenticate,
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                shape = CircleShape,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary
+                )
+            ) {
+                Text("Login to Spotify", style = MaterialTheme.typography.titleMedium)
+            }
         }
+        
+        Spacer(modifier = Modifier.height(24.dp))
+    }
+}
+
+@Composable
+fun WigglyProgressBar(
+    progress: Float,
+    isPlaying: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "wiggle")
+    val phase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 2f * Math.PI.toFloat(),
+        animationSpec = infiniteRepeatable(
+            animation = tween(1000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "phase"
+    )
+
+    val amplitude by animateFloatAsState(
+        targetValue = if (isPlaying) 6f else 0f,
+        animationSpec = spring(stiffness = Spring.StiffnessLow),
+        label = "amplitude"
+    )
+
+    val color = MaterialTheme.colorScheme.primary
+    val trackColor = MaterialTheme.colorScheme.surfaceVariant
+
+    Canvas(modifier = modifier) {
+        val width = size.width
+        val height = size.height
+        val centerY = height / 2
+        val strokeWidth = 8.dp.toPx()
+        
+        // Draw Track
+        drawLine(
+            color = trackColor,
+            start = Offset(0f, centerY),
+            end = Offset(width, centerY),
+            strokeWidth = strokeWidth,
+            cap = StrokeCap.Round
+        )
+
+        // Draw Wiggly Progress
+        val path = Path()
+        val segments = 100
+        val progressWidth = width * progress
+        
+        path.moveTo(0f, centerY)
+        for (i in 0..segments) {
+            val x = (i.toFloat() / segments) * progressWidth
+            // Sine wave wiggle
+            val wiggle = if (x > 0) sin(x * 0.05f + phase) * amplitude else 0f
+            path.lineTo(x, centerY + wiggle)
+        }
+
+        drawPath(
+            path = path,
+            color = color,
+            style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+        )
+        
+        // Thumb
+        drawCircle(
+            color = color,
+            radius = 10.dp.toPx(),
+            center = Offset(progressWidth, centerY + sin(progressWidth * 0.05f + phase) * amplitude)
+        )
     }
 }
 

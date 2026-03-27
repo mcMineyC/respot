@@ -17,10 +17,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.app.NotificationCompat
 import mobilebind.Librespot
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import org.json.JSONObject
 import java.io.File
 
@@ -49,10 +46,13 @@ class LibrespotService : Service() {
     var isStarted by mutableStateOf(false)
     var is_playing by mutableStateOf(false)
     var metadata by mutableStateOf<TrackMetadata?>(null)
+    var positionMs by mutableStateOf(0L)
+    var isLoggedIn by mutableStateOf(false)
 
     private var mediaSession: MediaSession? = null
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var progressJob: Job? = null
 
     inner class LocalBinder : Binder() {
         fun getService(): LibrespotService = this@LibrespotService
@@ -66,8 +66,28 @@ class LibrespotService : Service() {
         setupMediaSession()
         startForeground(NOTIFICATION_ID, createNotification())
         
+        isLoggedIn = restoreCredentials() != null
+
         serviceScope.launch {
             setupLibrespot()
+        }
+        
+        startProgressUpdateLoop()
+    }
+
+    private fun startProgressUpdateLoop() {
+        progressJob?.cancel()
+        progressJob = serviceScope.launch {
+            var lastUpdate = System.currentTimeMillis()
+            while (isActive) {
+                val now = System.currentTimeMillis()
+                val delta = now - lastUpdate
+                if (is_playing) {
+                    positionMs += delta
+                }
+                lastUpdate = now
+                delay(50) 
+            }
         }
     }
 
@@ -94,15 +114,12 @@ class LibrespotService : Service() {
                     handlePause()
                     updatePlaybackState(PlaybackState.STATE_STOPPED)
                 }
+                
+                override fun onSeekTo(pos: Long) {
+                    // Handle system seek if needed
+                }
             })
 
-            val metadata = MediaMetadata.Builder()
-                .putString(MediaMetadata.METADATA_KEY_TITLE, "Spotify Track")
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, "Librespot Artist")
-                .putString(MediaMetadata.METADATA_KEY_ALBUM, "Librespot Album")
-                .build()
-            setMetadata(metadata)
-            
             isActive = true
         }
         updatePlaybackState(PlaybackState.STATE_PAUSED)
@@ -149,56 +166,81 @@ class LibrespotService : Service() {
                     put("username", u)
                     put("data", d)
                 }.toString())
+                isLoggedIn = true
             }
         })
 
         try {
             instance.startWithConfigJSON(cfg.toString(), object : mobilebind.EventCallback {
                 override fun onEvent(event: String, data: String) {
-                    Log.d(TAG, "$event: $data")
-                    when (event) {
-                        "playing" -> {
-                            is_playing = data.toBoolean()
-                            updatePlaybackState(if (is_playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED)
-                        }
-                        "metadata" -> {
-                            try {
-                                val json = JSONObject(data)
-                                val artists = mutableListOf<String>()
-                                val artistsArray = json.optJSONArray("artist_names")
-                                if (artistsArray != null) {
-                                    for (i in 0 until artistsArray.length()) {
-                                        artists.add(artistsArray.getString(i))
+                    Log.d(TAG, "Librespot Event: $event, Data: $data")
+                    // Use Main dispatcher to update Compose state for safety and consistency
+                    serviceScope.launch(Dispatchers.Main) {
+                        when (event) {
+                            "playing" -> {
+                                is_playing = true
+                                updatePlaybackState(PlaybackState.STATE_PLAYING)
+                            }
+                            "paused" -> {
+                                is_playing = false
+                                parsePosition(data)
+                                updatePlaybackState(PlaybackState.STATE_PAUSED)
+                            }
+                            "seek" -> {
+                                parsePosition(data)
+                                updatePlaybackState(if (is_playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED)
+                            }
+                            "metadata" -> {
+                                try {
+                                    val json = JSONObject(data)
+                                    val artists = mutableListOf<String>()
+                                    val artistsArray = json.optJSONArray("artist_names")
+                                    if (artistsArray != null) {
+                                        for (i in 0 until artistsArray.length()) {
+                                            artists.add(artistsArray.getString(i))
+                                        }
                                     }
+                                    val meta = TrackMetadata(
+                                        uri = json.optString("uri"),
+                                        name = json.optString("name"),
+                                        artist_names = artists,
+                                        album_name = json.optString("album_name"),
+                                        album_cover_url = json.optString("album_cover_url"),
+                                        position = json.optLong("position"),
+                                        duration = json.optLong("duration"),
+                                        release_date = json.optString("release_date"),
+                                        track_number = json.optInt("track_number"),
+                                        disc_number = json.optInt("disc_number")
+                                    )
+                                    metadata = meta
+                                    positionMs = meta.position
+                                    updateMediaMetadata(meta)
+                                    isLoggedIn = true
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Failed to parse metadata", e)
                                 }
-                                val meta = TrackMetadata(
-                                    uri = json.optString("uri"),
-                                    name = json.optString("name"),
-                                    artist_names = artists,
-                                    album_name = json.optString("album_name"),
-                                    album_cover_url = json.optString("album_cover_url"),
-                                    position = json.optLong("position"),
-                                    duration = json.optLong("duration"),
-                                    release_date = json.optString("release_date"),
-                                    track_number = json.optInt("track_number"),
-                                    disc_number = json.optInt("disc_number")
-                                )
-                                metadata = meta
-                                updateMediaMetadata(meta)
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Failed to parse metadata", e)
                             }
                         }
                     }
                 }
                 override fun onLog(level: String, log: String) {
-                    Log.d(TAG, log)
+                    Log.d(TAG, "Librespot Log [$level]: $log")
                 }
             })
             isStarted = true
             Log.d(TAG, "Librespot started successfully")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start Librespot", e)
+        }
+    }
+
+    private fun parsePosition(data: String) {
+        if (data.isEmpty()) return
+        try {
+            val json = JSONObject(data)
+            positionMs = json.optLong("position", positionMs)
+        } catch (e: Exception) {
+            positionMs = data.toLongOrNull() ?: positionMs
         }
     }
 
@@ -225,20 +267,17 @@ class LibrespotService : Service() {
         return if (u.isNotEmpty() && d.isNotEmpty()) Pair(u, d) else null
     }
 
-    public fun beginInteractiveAuth(): String {
+    fun beginInteractiveAuth(): String {
         return librespot?.beginInteractiveAuth() ?: ""
     }
 
-    public fun completeInteractiveAuth(url: String) {
+    fun completeInteractiveAuth(url: String) {
         librespot?.completeInteractiveAuth(url)
     }
 
 
     fun handlePlay() {
-        if (!isStarted) {
-            Log.w(TAG, "handlePlay called but Librespot is not started")
-            return
-        }
+        if (!isStarted) return
         serviceScope.launch {
             try {
                 librespot?.play()
@@ -249,10 +288,7 @@ class LibrespotService : Service() {
     }
 
     fun handlePause() {
-        if (!isStarted) {
-            Log.w(TAG, "handlePause called but Librespot is not started")
-            return
-        }
+        if (!isStarted) return
         serviceScope.launch {
             try {
                 librespot?.pause()
@@ -291,9 +327,10 @@ class LibrespotService : Service() {
                 PlaybackState.ACTION_PAUSE or
                 PlaybackState.ACTION_SKIP_TO_NEXT or
                 PlaybackState.ACTION_SKIP_TO_PREVIOUS or
-                PlaybackState.ACTION_STOP
+                PlaybackState.ACTION_STOP or
+                PlaybackState.ACTION_SEEK_TO
             )
-            .setState(state, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1.0f)
+            .setState(state, positionMs, 1.0f)
             .build()
         mediaSession?.setPlaybackState(playbackState)
         
@@ -301,30 +338,10 @@ class LibrespotService : Service() {
         notificationManager.notify(NOTIFICATION_ID, createNotification())
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            "ACTION_PLAY" -> handlePlay()
-            "ACTION_PAUSE" -> handlePause()
-            "ACTION_NEXT" -> handleNext()
-            "ACTION_PREVIOUS" -> handlePrevious()
-        }
-        return START_STICKY
-    }
-
-    fun getLibrespotInstance(): Librespot {
-        if (librespot == null) {
-            librespot = Librespot()
-        }
-        return librespot!!
-    }
-
     private fun createNotificationChannel() {
         val name = "Librespot Playback"
-        val descriptionText = "Controls and status for Librespot"
         val importance = NotificationManager.IMPORTANCE_LOW
-        val channel = NotificationChannel(CHANNEL_ID, name, importance).apply {
-            description = descriptionText
-        }
+        val channel = NotificationChannel(CHANNEL_ID, name, importance)
         val notificationManager: NotificationManager =
             getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         notificationManager.createNotificationChannel(channel)
@@ -336,7 +353,7 @@ class LibrespotService : Service() {
         val title = mediaMetadata?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "Librespot"
         val artist = mediaMetadata?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: "Connected"
 
-        val playPauseAction = if (controller?.playbackState?.state == PlaybackState.STATE_PLAYING) {
+        val playPauseAction = if (is_playing) {
             NotificationCompat.Action(
                 android.R.drawable.ic_media_pause, "Pause",
                 PendingIntent.getService(this, 1, Intent(this, LibrespotService::class.java).apply { action = "ACTION_PAUSE" }, PendingIntent.FLAG_IMMUTABLE)
@@ -372,6 +389,14 @@ class LibrespotService : Service() {
 
     override fun onDestroy() {
         mediaSession?.release()
+        progressJob?.cancel()
         super.onDestroy()
+    }
+
+    fun getLibrespotInstance(): Librespot {
+        if (librespot == null) {
+            librespot = Librespot()
+        }
+        return librespot!!
     }
 }
