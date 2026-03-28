@@ -16,13 +16,12 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Pause
-import androidx.compose.material.icons.rounded.PlayArrow
-import androidx.compose.material.icons.rounded.SkipNext
-import androidx.compose.material.icons.rounded.SkipPrevious
+import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -38,6 +37,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.lifecycleScope
 import coil.compose.AsyncImage
 import com.example.librespotembedded.ui.theme.LibrespotEmbeddedTheme
 import kotlinx.coroutines.Dispatchers
@@ -89,7 +89,6 @@ class MainActivity : ComponentActivity() {
                 ) {
                     val service = librespotService
                     var showAuth by remember { mutableStateOf(false) }
-                    var isAuthenticating by remember { mutableStateOf(false) }
                     val scope = rememberCoroutineScope()
 
                     if (service == null) {
@@ -97,12 +96,15 @@ class MainActivity : ComponentActivity() {
                             CircularProgressIndicator()
                         }
                     } else {
+                        // Priority 1: WebView is visible for auth
                         if (showAuth) {
                             AndroidView(
                                 factory = { webView },
                                 modifier = Modifier.fillMaxSize()
                             )
-                        } else if (isAuthenticating) {
+                        } 
+                        // Priority 2: Daemon is processing credentials
+                        else if (service.isAuthenticating) {
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
@@ -113,34 +115,20 @@ class MainActivity : ComponentActivity() {
                                     CircularProgressIndicator()
                                     Spacer(modifier = Modifier.height(16.dp))
                                     Text("Finishing authentication...", style = MaterialTheme.typography.bodyLarge)
+                                    Spacer(modifier = Modifier.height(24.dp))
+                                    TextButton(onClick = { service.isAuthenticating = false }) {
+                                        Text("Cancel")
+                                    }
                                 }
                             }
-                        } else {
+                        } 
+                        // Priority 3: Player UI (handles both logged in and logged out states internally)
+                        else {
                             LibrespotPlayerUI(
                                 service = service,
                                 onAuthenticate = {
                                     val authUrl = service.beginInteractiveAuth()
-                                    webView.webViewClient = object : WebViewClient() {
-                                        override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
-                                            if (url != null && url.startsWith("http://127.0.0.1")) {
-                                                showAuth = false
-                                                isAuthenticating = true
-                                                scope.launch(Dispatchers.IO) {
-                                                    try {
-                                                        service.completeInteractiveAuth(url)
-                                                    } catch (e: Exception) {
-                                                        Log.e(TAG, "Error completing auth", e)
-                                                    } finally {
-                                                        withContext(Dispatchers.Main) {
-                                                            isAuthenticating = false
-                                                        }
-                                                    }
-                                                }
-                                                return true
-                                            }
-                                            return false
-                                        }
-                                    }
+                                    setupWebViewClient(service) { showAuth = false }
                                     webView.loadUrl(authUrl)
                                     showAuth = true
                                 }
@@ -148,6 +136,30 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    private fun setupWebViewClient(service: LibrespotService, onRedirect: () -> Unit) {
+        webView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
+                if (url != null && url.startsWith("http://127.0.0.1")) {
+                    Log.d(TAG, "Auth redirect detected: $url")
+                    onRedirect()
+                    // Start completion in IO thread
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        try {
+                            service.completeInteractiveAuth(url)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error completing auth", e)
+                            withContext(Dispatchers.Main) {
+                                service.isAuthenticating = false
+                            }
+                        }
+                    }
+                    return true
+                }
+                return false
             }
         }
     }
@@ -171,8 +183,8 @@ fun LibrespotPlayerUI(
     val position = service.positionMs
     val duration = metadata?.duration ?: 1L
     val progress = (position.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
+    var showSettings by remember { mutableStateOf(false) }
 
-    // Expressive scale animation for the album art
     val albumArtScale by animateFloatAsState(
         targetValue = if (isPlaying) 1f else 0.92f,
         animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
@@ -187,7 +199,7 @@ fun LibrespotPlayerUI(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        // Expressive Album Art - connected to playback toggle
+        // Album Art
         Card(
             onClick = { if (isPlaying) service.handlePause() else service.handlePlay() },
             modifier = Modifier
@@ -207,9 +219,7 @@ fun LibrespotPlayerUI(
                     )
                 } else {
                     Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(MaterialTheme.colorScheme.surfaceVariant),
+                        modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
@@ -221,12 +231,9 @@ fun LibrespotPlayerUI(
                     }
                 }
                 
-                // Show play icon overlay when paused to signify clickability
                 if (!isPlaying && metadata != null) {
                     Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(Color.Black.copy(alpha = 0.15f)),
+                        modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.15f)),
                         contentAlignment = Alignment.Center
                     ) {
                         Surface(
@@ -252,17 +259,13 @@ fun LibrespotPlayerUI(
         Spacer(modifier = Modifier.height(48.dp))
 
         // Track Info
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.Start
-        ) {
+        Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.Start) {
             Text(
                 text = metadata?.name ?: "No Track Playing",
                 style = MaterialTheme.typography.displaySmall,
                 fontWeight = FontWeight.Bold,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                color = MaterialTheme.colorScheme.onSurface
+                overflow = TextOverflow.Ellipsis
             )
             Text(
                 text = metadata?.artist_names?.joinToString(", ") ?: "Connect to start",
@@ -275,47 +278,20 @@ fun LibrespotPlayerUI(
 
         Spacer(modifier = Modifier.height(32.dp))
 
-        // Wiggly Progress Bar
-        WigglyProgressBar(
-            progress = progress,
-            isPlaying = isPlaying,
-            modifier = Modifier.fillMaxWidth().height(48.dp)
-        )
+        // Wiggly Progress
+        WigglyProgressBar(progress = progress, isPlaying = isPlaying, modifier = Modifier.fillMaxWidth().height(48.dp))
 
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(
-                text = formatTime(position),
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                text = formatTime(duration),
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+        Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(text = formatTime(position), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(text = formatTime(duration), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
 
         Spacer(modifier = Modifier.height(40.dp))
 
-        // Expressive Controls
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceAround
-        ) {
-            IconButton(
-                onClick = { service.handlePrevious() },
-                modifier = Modifier.size(64.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Rounded.SkipPrevious,
-                    contentDescription = "Previous",
-                    modifier = Modifier.size(40.dp),
-                    tint = MaterialTheme.colorScheme.onSurface
-                )
+        // Controls
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceAround) {
+            IconButton(onClick = { service.handlePrevious() }, modifier = Modifier.size(64.dp)) {
+                Icon(imageVector = Icons.Rounded.SkipPrevious, contentDescription = "Previous", modifier = Modifier.size(40.dp))
             }
 
             Surface(
@@ -335,36 +311,156 @@ fun LibrespotPlayerUI(
                 }
             }
 
-            IconButton(
-                onClick = { service.handleNext() },
-                modifier = Modifier.size(64.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Rounded.SkipNext,
-                    contentDescription = "Next",
-                    modifier = Modifier.size(40.dp),
-                    tint = MaterialTheme.colorScheme.onSurface
-                )
+            IconButton(onClick = { service.handleNext() }, modifier = Modifier.size(64.dp)) {
+                Icon(imageVector = Icons.Rounded.SkipNext, contentDescription = "Next", modifier = Modifier.size(40.dp))
             }
         }
 
         Spacer(modifier = Modifier.weight(1f))
 
-        if (!service.isLoggedIn) {
-            Button(
-                onClick = onAuthenticate,
-                modifier = Modifier.fillMaxWidth().height(56.dp),
-                shape = CircleShape,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    contentColor = MaterialTheme.colorScheme.onPrimary
-                )
+        // Bottom Actions
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+            horizontalArrangement = if (!service.isLoggedIn) Arrangement.spacedBy(16.dp) else Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (!service.isLoggedIn) {
+                Button(
+                    onClick = onAuthenticate,
+                    modifier = Modifier.weight(1f).height(56.dp),
+                    shape = CircleShape
+                ) {
+                    Text("Login to Spotify")
+                }
+            }
+            
+            FilledTonalIconButton(
+                onClick = { showSettings = true },
+                modifier = Modifier.size(56.dp),
+                shape = CircleShape
             ) {
-                Text("Login to Spotify", style = MaterialTheme.typography.titleMedium)
+                Icon(imageVector = Icons.Rounded.Settings, contentDescription = "Settings")
             }
         }
-        
-        Spacer(modifier = Modifier.height(24.dp))
+    }
+
+    if (showSettings) {
+        SettingsDialog(service = service, onDismiss = { showSettings = false }, onReLogin = onAuthenticate)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SettingsDialog(
+    service: LibrespotService,
+    onDismiss: () -> Unit,
+    onReLogin: () -> Unit
+) {
+    var name by remember { mutableStateOf(service.deviceName) }
+    var type by remember { mutableStateOf(service.deviceType) }
+    var vol by remember { mutableFloatStateOf(service.initialVolume.toFloat()) }
+    val creds = service.restoreCredentials()
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        shape = RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp),
+        containerColor = MaterialTheme.colorScheme.surface,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        dragHandle = { BottomSheetDefaults.DragHandle(color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)) }
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .padding(bottom = 48.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(24.dp)
+        ) {
+            Text("Settings", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+
+            // Device Name
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it },
+                label = { Text("Device Name") },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp)
+            )
+
+            // Device Type
+            Column {
+                Text("Device Type", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("smartphone", "computer", "tablet", "speaker").forEach {
+                        FilterChip(
+                            selected = type == it,
+                            onClick = { type = it },
+                            label = { Text(it.replaceFirstChar { it.uppercase() }) },
+                            shape = CircleShape
+                        )
+                    }
+                }
+            }
+
+            // Volume
+            Column {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("Initial Volume", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                    Text(vol.toInt().toString(), style = MaterialTheme.typography.labelLarge)
+                }
+                Slider(value = vol, onValueChange = { vol = it }, valueRange = 0f..16f, steps = 15)
+            }
+
+            // Device ID
+            Column {
+                Text("Device ID", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                Text(service.deviceId, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(onClick = { service.regenerateDeviceId() }, shape = CircleShape) {
+                    Icon(Icons.Rounded.Refresh, null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Regenerate ID")
+                }
+            }
+
+            // Credentials
+            creds?.let { (u, _) ->
+                Column(
+                    modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(16.dp)).padding(16.dp)
+                ) {
+                    Text("Logged in as", style = MaterialTheme.typography.labelSmall)
+                    Text(u, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(
+                        onClick = { 
+                            service.logout()
+                            onDismiss()
+                            onReLogin()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = CircleShape
+                    ) {
+                        Text("Logout & Re-login")
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Button(
+                onClick = {
+                    service.saveSettings(name, type, vol.toInt())
+                    onDismiss()
+                },
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                shape = CircleShape
+            ) {
+                Text("Save & Restart")
+            }
+        }
     }
 }
 
@@ -400,16 +496,8 @@ fun WigglyProgressBar(
         val centerY = height / 2
         val strokeWidth = 8.dp.toPx()
         
-        // Draw Track
-        drawLine(
-            color = trackColor,
-            start = Offset(0f, centerY),
-            end = Offset(width, centerY),
-            strokeWidth = strokeWidth,
-            cap = StrokeCap.Round
-        )
+        drawLine(color = trackColor, start = Offset(0f, centerY), end = Offset(width, centerY), strokeWidth = strokeWidth, cap = StrokeCap.Round)
 
-        // Draw Wiggly Progress
         val path = Path()
         val segments = 100
         val progressWidth = width * progress
@@ -417,23 +505,12 @@ fun WigglyProgressBar(
         path.moveTo(0f, centerY)
         for (i in 0..segments) {
             val x = (i.toFloat() / segments) * progressWidth
-            // Sine wave wiggle
             val wiggle = if (x > 0) sin(x * 0.05f + phase) * amplitude else 0f
             path.lineTo(x, centerY + wiggle)
         }
 
-        drawPath(
-            path = path,
-            color = color,
-            style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
-        )
-        
-        // Thumb
-        drawCircle(
-            color = color,
-            radius = 10.dp.toPx(),
-            center = Offset(progressWidth, centerY + sin(progressWidth * 0.05f + phase) * amplitude)
-        )
+        drawPath(path = path, color = color, style = Stroke(width = strokeWidth, cap = StrokeCap.Round))
+        drawCircle(color = color, radius = 10.dp.toPx(), center = Offset(progressWidth, centerY + sin(progressWidth * 0.05f + phase) * amplitude))
     }
 }
 
