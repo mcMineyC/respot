@@ -18,33 +18,41 @@ import android.util.Log
 import androidx.compose.runtime.*
 import androidx.core.app.NotificationCompat
 import androidx.core.content.edit
+import androidx.media.app.NotificationCompat as MediaNotificationCompat
 import coil.ImageLoader
 import coil.request.ImageRequest
 import mobilebind.Librespot
 import kotlinx.coroutines.*
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.security.SecureRandom
 import java.util.Locale
-import java.util.UUID
 
 data class TrackMetadata(
     val uri: String,
     val name: String,
-    val artist_names: List<String>,
-    val album_name: String,
-    val album_cover_url: String,
+    val artistNames: List<String>,
+    val albumName: String,
+    val albumCoverUrl: String,
     val position: Long,
     val duration: Long,
-    val release_date: String,
-    val track_number: Int,
-    val disc_number: Int
+    val releaseDate: String,
+    val trackNumber: Int,
+    val discNumber: Int
+)
+
+data class SpotifyDevice(
+    val id: String,
+    val name: String,
+    val type: String,
+    val isActive: Boolean
 )
 
 class LibrespotService : Service() {
-    private val TAG = "LibrespotService"
-    private val CHANNEL_ID = "librespot_channel"
-    private val NOTIFICATION_ID = 1
+    private val tag = "LibrespotService"
+    private val channelId = "librespot_channel"
+    private val notificationId = 1
     private val credentialsFileName = "creds.json"
     private val prefs by lazy { getSharedPreferences("librespot_prefs", Context.MODE_PRIVATE) }
     private val secureRandom = SecureRandom()
@@ -53,16 +61,20 @@ class LibrespotService : Service() {
     
     // Public state observable by Compose
     var isStarted by mutableStateOf(false)
-    var is_playing by mutableStateOf(false)
+    var isPlaying by mutableStateOf(false)
     var metadata by mutableStateOf<TrackMetadata?>(null)
-    var positionMs by mutableStateOf(0L)
+    var positionMs by mutableLongStateOf(0L)
     var isLoggedIn by mutableStateOf(false)
     var isAuthenticating by mutableStateOf(false)
+    
+    var shuffleEnabled by mutableStateOf(false)
+    var repeatMode by mutableIntStateOf(0) // 0: off, 1: track, 2: context
+    var availableDevices by mutableStateOf<List<SpotifyDevice>>(emptyList())
 
     // Configurable Settings
     var deviceName by mutableStateOf("")
     var deviceType by mutableStateOf("")
-    var initialVolume by mutableStateOf(14)
+    var initialVolume by mutableIntStateOf(14)
     var deviceId by mutableStateOf("")
 
     private var mediaSession: MediaSession? = null
@@ -81,7 +93,7 @@ class LibrespotService : Service() {
         loadSettings()
         createNotificationChannel()
         setupMediaSession()
-        startForeground(NOTIFICATION_ID, createNotification())
+        startForeground(notificationId, createNotification())
         
         isLoggedIn = restoreCredentials() != null
 
@@ -141,9 +153,12 @@ class LibrespotService : Service() {
 
     fun restart() {
         serviceScope.launch {
-            // We create a new instance to apply new config. 
-            // The daemon inside might need cleanup if mobilebind supported it.
             isStarted = false
+            try {
+                librespot?.stop()
+            } catch (e: Exception) {
+                Log.e(tag, "Error stopping Librespot", e)
+            }
             librespot = Librespot() 
             setupLibrespot()
         }
@@ -156,7 +171,7 @@ class LibrespotService : Service() {
             while (isActive) {
                 val now = System.currentTimeMillis()
                 val delta = now - lastUpdate
-                if (is_playing) {
+                if (isPlaying) {
                     positionMs += delta
                 }
                 lastUpdate = now
@@ -172,6 +187,7 @@ class LibrespotService : Service() {
                 override fun onPause() { handlePause() }
                 override fun onSkipToNext() { handleNext() }
                 override fun onSkipToPrevious() { handlePrevious() }
+                override fun onSeekTo(pos: Long) { handleSeek(pos) }
                 override fun onStop() {
                     handlePause()
                     updatePlaybackState(PlaybackState.STATE_STOPPED)
@@ -203,7 +219,7 @@ class LibrespotService : Service() {
             put("server", JSONObject().apply { put("enabled", false) })
             put("zeroconf_enabled", false)
         }
-        Log.i(TAG, "Starting Librespot with config: ${cfg.toString(2)}")
+        Log.i(tag, "Starting Librespot with config: ${cfg.toString(2)}")
 
         restoreCredentials()?.let { (u, d) ->
             cfg.getJSONObject("credentials")
@@ -216,7 +232,7 @@ class LibrespotService : Service() {
 
         instance.setCredentialCallback(object : mobilebind.CredentialCallback {
             override fun onCredentialsPersist(credentialsJson: String) {
-                Log.d(TAG, "Credentials persisted")
+                Log.d(tag, "Credentials persisted")
                 val j = JSONObject(credentialsJson)
                 val u = j.optString("username")
                 val d = j.optString("data")
@@ -235,22 +251,32 @@ class LibrespotService : Service() {
         try {
             instance.startWithConfigJSON(cfg.toString(), object : mobilebind.EventCallback {
                 override fun onEvent(event: String, data: String) {
-                    Log.d(TAG, "Librespot Event: $event, Data: $data")
+                    Log.d(tag, "Librespot Event: $event, Data: $data")
                     // Use Main dispatcher to update Compose state for safety and consistency
                     serviceScope.launch(Dispatchers.Main) {
                         when (event) {
                             "playing" -> {
-                                is_playing = true
+                                isPlaying = true
                                 updatePlaybackState(PlaybackState.STATE_PLAYING)
                             }
                             "paused" -> {
-                                is_playing = false
+                                isPlaying = false
                                 parsePosition(data)
                                 updatePlaybackState(PlaybackState.STATE_PAUSED)
                             }
                             "seek" -> {
                                 parsePosition(data)
-                                updatePlaybackState(if (is_playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED)
+                                updatePlaybackState(if (isPlaying) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED)
+                            }
+                            "shuffle" -> {
+                                shuffleEnabled = data.toBoolean()
+                            }
+                            "repeat" -> {
+                                repeatMode = when(data) {
+                                    "track" -> 1
+                                    "context" -> 2
+                                    else -> 0
+                                }
                             }
                             "metadata" -> {
                                 try {
@@ -265,14 +291,14 @@ class LibrespotService : Service() {
                                     val meta = TrackMetadata(
                                         uri = json.optString("uri"),
                                         name = json.optString("name"),
-                                        artist_names = artists,
-                                        album_name = json.optString("album_name"),
-                                        album_cover_url = json.optString("album_cover_url"),
+                                        artistNames = artists,
+                                        albumName = json.optString("album_name"),
+                                        albumCoverUrl = json.optString("album_cover_url"),
                                         position = json.optLong("position"),
                                         duration = json.optLong("duration"),
-                                        release_date = json.optString("release_date"),
-                                        track_number = json.optInt("track_number"),
-                                        disc_number = json.optInt("disc_number")
+                                        releaseDate = json.optString("release_date"),
+                                        trackNumber = json.optInt("track_number"),
+                                        discNumber = json.optInt("disc_number")
                                     )
                                     metadata = meta
                                     positionMs = meta.position
@@ -280,20 +306,20 @@ class LibrespotService : Service() {
                                     isLoggedIn = true
                                     isAuthenticating = false
                                 } catch (e: Exception) {
-                                    Log.e(TAG, "Failed to parse metadata", e)
+                                    Log.e(tag, "Failed to parse metadata", e)
                                 }
                             }
                         }
                     }
                 }
                 override fun onLog(level: String, log: String) {
-                    Log.d(TAG, "Librespot Log [$level]: $log")
+                    Log.d(tag, "Librespot Log [$level]: $log")
                 }
             })
             isStarted = true
-            Log.d(TAG, "Librespot started successfully")
+            Log.d(tag, "Librespot started successfully")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start Librespot", e)
+            Log.e(tag, "Failed to start Librespot", e)
         }
     }
 
@@ -309,16 +335,15 @@ class LibrespotService : Service() {
 
     private fun updateMediaMetadata(meta: TrackMetadata) {
         serviceScope.launch {
-            val bitmap = loadBitmap(meta.album_cover_url)
+            val bitmap = loadBitmap(meta.albumCoverUrl)
             val builder = MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE, meta.name)
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, meta.artist_names.joinToString(", "))
-                .putString(MediaMetadata.METADATA_KEY_ALBUM, meta.album_name)
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, meta.artistNames.joinToString(", "))
+                .putString(MediaMetadata.METADATA_KEY_ALBUM, meta.albumName)
                 .putLong(MediaMetadata.METADATA_KEY_DURATION, meta.duration)
             
             if (bitmap != null) {
                 builder.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, bitmap)
-                builder.putBitmap(MediaMetadata.METADATA_KEY_ART, bitmap)
             }
             
             val mediaMetadata = builder.build()
@@ -326,7 +351,7 @@ class LibrespotService : Service() {
             withContext(Dispatchers.Main) {
                 mediaSession?.setMetadata(mediaMetadata)
                 val notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-                notificationManager.notify(NOTIFICATION_ID, createNotification())
+                notificationManager.notify(notificationId, createNotification())
             }
         }
     }
@@ -338,12 +363,12 @@ class LibrespotService : Service() {
                 val loader = ImageLoader(this@LibrespotService)
                 val request = ImageRequest.Builder(this@LibrespotService)
                     .data(url)
-                    .allowHardware(false) // Required for getting bitmap to use in notification
+                    .allowHardware(false) 
                     .build()
                 val result = loader.execute(request)
                 (result.drawable as? BitmapDrawable)?.bitmap
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to load bitmap", e)
+                Log.e(tag, "Failed to load bitmap", e)
                 null
             }
         }
@@ -375,7 +400,7 @@ class LibrespotService : Service() {
             try {
                 librespot?.play()
             } catch (e: Exception) {
-                Log.e(TAG, "Error in play()", e)
+                Log.e(tag, "Error in play()", e)
             }
         }
     }
@@ -386,7 +411,7 @@ class LibrespotService : Service() {
             try {
                 librespot?.pause()
             } catch (e: Exception) {
-                Log.e(TAG, "Error in pause()", e)
+                Log.e(tag, "Error in pause()", e)
             }
         }
     }
@@ -397,7 +422,7 @@ class LibrespotService : Service() {
             try {
                 librespot?.next()
             } catch (e: Exception) {
-                Log.e(TAG, "Error in next()", e)
+                Log.e(tag, "Error in next()", e)
             }
         }
     }
@@ -408,7 +433,85 @@ class LibrespotService : Service() {
             try {
                 librespot?.previous()
             } catch (e: Exception) {
-                Log.e(TAG, "Error in previous()", e)
+                Log.e(tag, "Error in previous()", e)
+            }
+        }
+    }
+
+    fun handleSeek(pos: Long) {
+        if (!isStarted) return
+        serviceScope.launch {
+            try {
+                librespot?.seek(pos)
+                positionMs = pos
+            } catch (e: Exception) {
+                Log.e(tag, "Error in seek()", e)
+            }
+        }
+    }
+
+    fun handleShuffle(enabled: Boolean) {
+        if (!isStarted) return
+        serviceScope.launch {
+            try {
+                librespot?.setShuffle(enabled)
+                shuffleEnabled = enabled
+            } catch (e: Exception) {
+                Log.e(tag, "Error in setShuffle()", e)
+            }
+        }
+    }
+
+    fun handleRepeat(mode: Int) {
+        if (!isStarted) return
+        val modeStr = when(mode) {
+            1 -> "track"
+            2 -> "context"
+            else -> "off"
+        }
+        serviceScope.launch {
+            try {
+                librespot?.setRepeat(modeStr)
+                repeatMode = mode
+            } catch (e: Exception) {
+                Log.e(tag, "Error in setRepeat()", e)
+            }
+        }
+    }
+
+    fun refreshDevices() {
+        if (!isStarted) return
+        serviceScope.launch {
+            try {
+                val jsonStr = librespot?.listDevicesJSON() ?: "[]"
+                val arr = JSONArray(jsonStr)
+                val list = mutableListOf<SpotifyDevice>()
+                for (i in 0 until arr.length()) {
+                    val obj = arr.getJSONObject(i)
+                    list.add(SpotifyDevice(
+                        id = obj.getString("id"),
+                        name = obj.getString("name"),
+                        type = obj.getString("type"),
+                        isActive = obj.getBoolean("is_active")
+                    ))
+                }
+                withContext(Dispatchers.Main) {
+                    availableDevices = list
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "Error in listDevicesJSON()", e)
+            }
+        }
+    }
+
+    fun transferPlayback(deviceId: String) {
+        if (!isStarted) return
+        serviceScope.launch {
+            try {
+                librespot?.transferPlayback(deviceId, true)
+                refreshDevices()
+            } catch (e: Exception) {
+                Log.e(tag, "Error in transferPlayback()", e)
             }
         }
     }
@@ -420,20 +523,21 @@ class LibrespotService : Service() {
                 PlaybackState.ACTION_PAUSE or
                 PlaybackState.ACTION_SKIP_TO_NEXT or
                 PlaybackState.ACTION_SKIP_TO_PREVIOUS or
-                PlaybackState.ACTION_STOP
+                PlaybackState.ACTION_STOP or
+                PlaybackState.ACTION_SEEK_TO
             )
             .setState(state, positionMs, 1.0f)
             .build()
         mediaSession?.setPlaybackState(playbackState)
         
         val notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(NOTIFICATION_ID, createNotification())
+        notificationManager.notify(notificationId, createNotification())
     }
 
     private fun createNotificationChannel() {
         val name = "Librespot Playback"
         val importance = NotificationManager.IMPORTANCE_LOW
-        val channel = NotificationChannel(CHANNEL_ID, name, importance)
+        val channel = NotificationChannel(channelId, name, importance)
         val notificationManager: NotificationManager =
             getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         notificationManager.createNotificationChannel(channel)
@@ -446,26 +550,22 @@ class LibrespotService : Service() {
         val artist = mediaMetadata?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: "Connected"
         val artwork = mediaMetadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
 
-        val playPauseAction = if (is_playing) {
-            NotificationCompat.Action(
-                android.R.drawable.ic_media_pause, "Pause",
-                PendingIntent.getService(this, 1, Intent(this, LibrespotService::class.java).apply { action = "ACTION_PAUSE" }, PendingIntent.FLAG_IMMUTABLE)
-            )
-        } else {
-            NotificationCompat.Action(
-                android.R.drawable.ic_media_play, "Play",
-                PendingIntent.getService(this, 2, Intent(this, LibrespotService::class.java).apply { action = "ACTION_PLAY" }, PendingIntent.FLAG_IMMUTABLE)
-            )
-        }
+        val playPauseAction = NotificationCompat.Action(
+            if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
+            if (isPlaying) "Pause" else "Play",
+            PendingIntent.getService(this, if (isPlaying) 1 else 2, 
+                Intent(this, LibrespotService::class.java).apply { action = if (isPlaying) "ACTION_PAUSE" else "ACTION_PLAY" }, 
+                PendingIntent.FLAG_IMMUTABLE)
+        )
 
         val intent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
 
-        val mediaStyle = androidx.media.app.NotificationCompat.MediaStyle()
+        val mediaStyle = MediaNotificationCompat.MediaStyle()
             .setMediaSession(android.support.v4.media.session.MediaSessionCompat.Token.fromToken(mediaSession?.sessionToken))
             .setShowActionsInCompactView(0, 1, 2)
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        return NotificationCompat.Builder(this, channelId)
             .setContentTitle(title)
             .setContentText(artist)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
