@@ -305,6 +305,17 @@ class LibrespotService : Service() {
                                     updateMediaMetadata(meta)
                                     isLoggedIn = true
                                     isAuthenticating = false
+                                    
+                                    // Update shuffle/repeat from metadata if available
+                                    shuffleEnabled = json.optBoolean("shuffle", shuffleEnabled)
+                                    val repeatStr = json.optString("repeat", "")
+                                    if (repeatStr.isNotEmpty()) {
+                                        repeatMode = when(repeatStr) {
+                                            "track" -> 1
+                                            "context" -> 2
+                                            else -> 0
+                                        }
+                                    }
                                 } catch (e: Exception) {
                                     Log.e(tag, "Failed to parse metadata", e)
                                 }
@@ -317,6 +328,10 @@ class LibrespotService : Service() {
                 }
             })
             isStarted = true
+            serviceScope.launch {
+                delay(1000)
+                syncState()
+            }
             Log.d(tag, "Librespot started successfully")
         } catch (e: Exception) {
             Log.e(tag, "Failed to start Librespot", e)
@@ -509,9 +524,56 @@ class LibrespotService : Service() {
         serviceScope.launch {
             try {
                 librespot?.transferPlayback(deviceId, true)
+                // Sync state immediately after transfer to get shuffle/repeat settings
+                delay(1500)
+                syncState()
                 refreshDevices()
             } catch (e: Exception) {
                 Log.e(tag, "Error in transferPlayback()", e)
+            }
+        }
+    }
+
+    fun syncState() {
+        return
+        if (!isStarted) return
+        serviceScope.launch {
+            try {
+                // Discover the correct method names from the AAR using reflection or as provided by user
+                val shuffle = librespot?.javaClass?.getMethod("getShuffle")?.invoke(librespot) as? Boolean ?: false
+                val repeat = librespot?.javaClass?.getMethod("getRepeat")?.invoke(librespot) as? String ?: "off"
+                
+                withContext(Dispatchers.Main) {
+                    shuffleEnabled = shuffle
+                    repeatMode = when(repeat) {
+                        "track" -> 1
+                        "context" -> 2
+                        else -> 0
+                    }
+                    updatePlaybackState(if (isPlaying) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED)
+                }
+            } catch (e: Exception) {
+                // Fallback to dumpStateJSON if specific getters fail
+                try {
+                    val stateJson = librespot?.dumpStateJSON() ?: return@launch
+                    val json = JSONObject(stateJson)
+                    withContext(Dispatchers.Main) {
+                        isPlaying = json.optBoolean("playing", isPlaying)
+                        shuffleEnabled = json.optBoolean("shuffle", shuffleEnabled)
+                        val repeatStr = json.optString("repeat", "")
+                        if (repeatStr.isNotEmpty()) {
+                            repeatMode = when(repeatStr) {
+                                "track" -> 1
+                                "context" -> 2
+                                else -> 0
+                            }
+                        }
+                        positionMs = json.optLong("position", positionMs)
+                        updatePlaybackState(if (isPlaying) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED)
+                    }
+                } catch (e2: Exception) {
+                    Log.e(tag, "Error syncing state with fallback", e2)
+                }
             }
         }
     }
